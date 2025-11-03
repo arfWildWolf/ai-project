@@ -2,15 +2,23 @@
  TODO:
  - [ ] buat 2 sistem weather (nowacast based on kecamatan, weather biasa)
  - [ ] buat sistem buat nowacastnya nanya ke user buat lebih spesifik mau tepatnya di lokasi yang mana
- - [ ] 
+ - [ ]
  */
 
 import "dotenv/config";
-import { Client, EmbedBuilder, GatewayIntentBits } from "discord.js";
+import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  Client,
+  EmbedBuilder,
+  GatewayIntentBits,
+} from "discord.js";
 import axios from "axios";
 import fs from "fs";
 import path from "path";
 import { InferenceClient } from "@huggingface/inference";
+import { DOMParser } from "xmldom";
 
 // ---------- CONFIG ----------
 const PREFIX = "!";
@@ -38,11 +46,13 @@ const wilayahData = fs.existsSync(KODE_WILAYAH_FILE)
 
 // ---------- ENSURE DATA FOLDER ----------
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-if (!fs.existsSync(SUBSCRIBERS_FILE))
+if (!fs.existsSync(SUBSCRIBERS_FILE)) {
   fs.writeFileSync(SUBSCRIBERS_FILE, "[]", "utf8");
-if (!fs.existsSync(FACTS_FILE))
+}
+if (!fs.existsSync(FACTS_FILE)) {
   fs.writeFileSync(FACTS_FILE, JSON.stringify([], null, 2), "utf8");
-if (!fs.existsSync(QUOTES_FILE))
+}
+if (!fs.existsSync(QUOTES_FILE)) {
   fs.writeFileSync(
     QUOTES_FILE,
     JSON.stringify(
@@ -57,6 +67,7 @@ if (!fs.existsSync(QUOTES_FILE))
     ),
     "utf8",
   );
+}
 
 // ---------- UTILITIES ----------
 const readJSON = (p) => JSON.parse(fs.readFileSync(p, "utf8"));
@@ -127,6 +138,52 @@ function findWilayahCode(cityName = "jakarta") {
   return wilayahData.find((w) => w.kelurahan.toLowerCase().includes(lower));
 }
 
+async function earlyWarning() {
+  // https://www.bmkg.go.id/alerts/nowcast/id
+  const { data } = await axios.get("https://www.bmkg.go.id/alerts/nowcast/id");
+
+  const parser = new DOMParser();
+  const xmlDoc = parser.parseFromString(data, "text/xml");
+
+  const items = xmlDoc.getElementsByTagName("item");
+
+  const alerts = [];
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    const link = item.getElementsByTagName("link")[0]?.textContent || "";
+
+    const { data } = await axios.get(link);
+    const moreDetailData = parser.parseFromString(data, "text/xml");
+
+    const imgActualLink =
+      moreDetailData.getElementsByTagName("web")[0]?.textContent;
+    const title =
+      moreDetailData.getElementsByTagName("headline")[0]?.textContent || "";
+    const description =
+      moreDetailData.getElementsByTagName("description")[0]?.textContent || "";
+    const effective =
+      moreDetailData.getElementsByTagName("effective")[0]?.textContent || "";
+    const expired =
+      moreDetailData.getElementsByTagName("expires")[0]?.textContent || "";
+    const senderName =
+      moreDetailData.getElementsByTagName("senderName")[0]?.textContent || "";
+
+    alerts.push({
+      title,
+      link,
+      imgActualLink,
+      description,
+      effective,
+      expired,
+      senderName,
+    });
+  }
+
+  // console.log(alerts);
+  return alerts;
+}
+
+earlyWarning();
 client.on("messageCreate", async (message) => {
   if (message.author.bot || !message.content.startsWith(PREFIX)) return;
   const [cmd, ...args] = message.content
@@ -249,6 +306,107 @@ client.on("messageCreate", async (message) => {
         message.reply("⚠️ Failed to fetch weather data from BMKG.");
       }
       break;
+    case "weatheralert":
+      const items = await earlyWarning();
+
+      // items.forEach(async (e) => {
+      //   const alertEmbed = new EmbedBuilder()
+      //     .setColor("#ffcc00")
+      //     .setTitle(`⚠️ ${e.title}`)
+      //     .setURL(e.link)
+      //     .setDescription(e.description)
+      //     .setImage(e.imgActualLink)
+      //     .setFooter({ text: `valid: ${e.effective} sampai: ${e.expired}` });
+      //
+      //   await message.channel.send({
+      //     embeds: [alertEmbed],
+      //   });
+      // });
+      let index = 0;
+      const generateEmbed = (i) => {
+        const firstItem = items[i];
+
+        return new EmbedBuilder()
+          .setColor("#ffcc00")
+          .setTitle(`⚠️ ${firstItem.title}`)
+          .setURL(firstItem.link)
+          .setDescription(firstItem.description)
+          .setImage(firstItem.imgActualLink)
+          .setFooter({
+            text: `valid: ${firstItem.effective} sampai: ${firstItem.expired} | ${
+              i + 1
+            }/${items.length + 1}`,
+          });
+      };
+
+      // Button
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId("prev_alert")
+          .setLabel("⬅️ Sebelumnya")
+          .setStyle(ButtonStyle.Secondary)
+          .setDisabled(true),
+        new ButtonBuilder()
+          .setCustomId("next_alert")
+          .setLabel("Berikutnya ➡️")
+          .setStyle(ButtonStyle.Primary)
+          .setDisabled(items.length <= 1),
+      );
+      // Send message with button
+      const sent = await message.channel.send({
+        embeds: [generateEmbed(index)],
+        components: [row],
+      });
+
+      const collector = sent.createMessageComponentCollector({
+        filter: (i) => ["prev_alert", "next_alert"].includes(i.customId),
+        time: 120_000, // 2 minutes
+      });
+
+      collector.on("collect", async (i) => {
+        await i.deferUpdate();
+
+        if (i.customId === "next_alert" && index <= items.length - 1) index++;
+        else if (i.customId === "prev_alert" && index > 0) index--;
+
+        // Update button states
+        const newRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId("prev_alert")
+            .setLabel("⬅️ Sebelumnya")
+            .setStyle(ButtonStyle.Secondary)
+            .setDisabled(index === 0),
+          new ButtonBuilder()
+            .setCustomId("next_alert")
+            .setLabel("Berikutnya ➡️")
+            .setStyle(ButtonStyle.Primary)
+            .setDisabled(index === items.length - 1),
+        );
+
+        await sent.edit({
+          embeds: [generateEmbed(index)],
+          components: [newRow],
+        });
+      });
+
+      collector.on("end", () => {
+        // Disable buttons after time out
+        const disabledRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId("prev_alert")
+            .setLabel("⬅️ Sebelumnya")
+            .setStyle(ButtonStyle.Secondary)
+            .setDisabled(true),
+          new ButtonBuilder()
+            .setCustomId("next_alert")
+            .setLabel("Berikutnya ➡️")
+            .setStyle(ButtonStyle.Primary)
+            .setDisabled(true),
+        );
+
+        sent.edit({ components: [disabledRow] }).catch(() => {});
+      });
+      break;
     case "askai":
       if (args.length === 0) {
         return message.reply(
@@ -271,8 +429,9 @@ client.on("messageCreate", async (message) => {
       break;
 
     case "fact":
-      if (facts.length === 0)
+      if (facts.length === 0) {
         return message.reply("⚙️ No facts available yet.");
+      }
       const randomFact = facts[Math.floor(Math.random() * facts.length)];
       message.channel.send(`📘 **Science Fact:** ${randomFact}`);
       break;
